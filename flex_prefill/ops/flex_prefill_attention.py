@@ -619,7 +619,6 @@ def torch_block_wise_attention(
     block_size: int,
     grid_offset: int = 0,
 ):
-
     b, n, h, d = q.shape
     assert k.shape == q.shape
     assert v.shape == k.shape
@@ -928,20 +927,21 @@ def triton_column_count_cumsum(x: torch.Tensor, num_columns: int) -> torch.Tenso
     # plus r by 1 to avoid tl.histogram bug
     block_size_r = triton.next_power_of_2(r + 2)
     y = torch.zeros(b, h, r + 1, device=x.device, dtype=torch.int32)
-    count_kernel[(b, h)](
-        x,
-        y,
-        k,
-        r,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        block_size_k,
-        block_size_r,
-    )
+    with torch.cuda.device(x.device):
+        count_kernel[(b, h)](
+            x,
+            y,
+            k,
+            r,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            block_size_k,
+            block_size_r,
+        )
     return y
 
 
@@ -1239,51 +1239,52 @@ def triton_block_wise_prefill_attention(
     # launch attention kernel
     o = torch.empty_like(q)
     num_warps, num_stages = get_num_warps_stages(head_dim, block_size, IS_HOPPER_GPU)
-    block_wise_prefill_attention_kernel[(batch_size, num_q_heads, total_q_blocks)](
-        q,
-        k,
-        v,
-        o,
-        block_idx,
-        idx_bins,
-        batch_size,
-        num_q_heads,
-        num_kv_heads,
-        num_share_q_heads,
-        q_len,
-        k_len,
-        head_dim,
-        total_q_blocks,
-        grid_offset,
-        softmax_scale,
-        gqa_interleave,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
-        block_idx.stride(0),
-        block_idx.stride(1),
-        block_idx.stride(2),
-        idx_bins.stride(0),
-        idx_bins.stride(1),
-        idx_bins.stride(2),
-        BLOCK_SIZE_Q=block_size,
-        BLOCK_SIZE_K=block_size,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    with torch.cuda.device(q.device):
+        block_wise_prefill_attention_kernel[(batch_size, num_q_heads, total_q_blocks)](
+            q,
+            k,
+            v,
+            o,
+            block_idx,
+            idx_bins,
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            num_share_q_heads,
+            q_len,
+            k_len,
+            head_dim,
+            total_q_blocks,
+            grid_offset,
+            softmax_scale,
+            gqa_interleave,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            block_idx.stride(0),
+            block_idx.stride(1),
+            block_idx.stride(2),
+            idx_bins.stride(0),
+            idx_bins.stride(1),
+            idx_bins.stride(2),
+            BLOCK_SIZE_Q=block_size,
+            BLOCK_SIZE_K=block_size,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
     return o
 
 
@@ -1436,26 +1437,27 @@ def triton_bnhd_pool(x: torch.Tensor, kernel_size: int, pool_type: str = "avg"):
         triton.cdiv(n, META["BLOCK_SIZE_N"]),
         triton.cdiv(h, META["BLOCK_SIZE_H"]),
     )
-    bnhd_pool_kernel[grid](
-        x,
-        y,
-        pool_type,
-        b,
-        n,
-        h,
-        d,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        x.stride(3),
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        y.stride(3),
-        BLOCK_SIZE_N=kernel_size,
-        BLOCK_SIZE_H=block_size_h,
-        BLOCK_SIZE_D=block_size_d,
-    )
+    with torch.cuda.device(x.device):
+        bnhd_pool_kernel[grid](
+            x,
+            y,
+            pool_type,
+            b,
+            n,
+            h,
+            d,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            y.stride(3),
+            BLOCK_SIZE_N=kernel_size,
+            BLOCK_SIZE_H=block_size_h,
+            BLOCK_SIZE_D=block_size_d,
+        )
     return y
 
 
@@ -1516,21 +1518,22 @@ def triton_bhn_sumpool(x: torch.Tensor, kernel_size: int):
         triton.cdiv(h, META["BLOCK_SIZE_H"]),
         triton.cdiv(n, META["BLOCK_SIZE_N"]),
     )
-    bhn_sumpool_kernel[grid](
-        x,
-        y,
-        b,
-        h,
-        n,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        BLOCK_SIZE_N=kernel_size,
-        BLOCK_SIZE_H=block_size_h,
-    )
+    with torch.cuda.device(x.device):
+        bhn_sumpool_kernel[grid](
+            x,
+            y,
+            b,
+            h,
+            n,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            BLOCK_SIZE_N=kernel_size,
+            BLOCK_SIZE_H=block_size_h,
+        )
     return y
 
 
@@ -1654,14 +1657,18 @@ def get_active_blocks(
             ),
             k.view(k.shape[0], k.shape[1], 1, -1, head_dim),
         )
-    global causal_mask
-    if causal_mask is None:
-        causal_mask = torch.arange(0, block_size, device=last_q.device)
-        causal_mask = causal_mask[:, None] >= causal_mask[None, :]
-        causal_mask = causal_mask[None, None, None, ...]
-    qk[..., -block_size:].masked_fill_(
-        ~causal_mask[..., :block_size, :block_size], float("-inf")
+    # Create causal mask on the same device as qk
+    causal_mask = torch.arange(0, block_size, device=qk.device)
+    causal_mask = causal_mask[:, None] >= causal_mask[None, :]
+    causal_mask = causal_mask[None, None, None, ...]
+    # Ensure the causal mask is properly broadcast to match QK's shape
+    mask = ~causal_mask[..., : qk.shape[-2], : qk.shape[-1]]
+    # Slice only the last block_size elements and apply the mask
+    qk_last = qk[..., -block_size:]
+    qk_last.masked_fill_(
+        mask[:, :, :, : qk_last.shape[-2], : qk_last.shape[-1]], float("-inf")
     )
+
     # softmax
     qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
     qk = rearrange(qk, "b h g i j -> b (h g) i j")
@@ -1870,8 +1877,8 @@ if __name__ == "__main__":
         min_budget=1024,
         max_budget=None,
         gqa_interleave=False,
-        block_size=128,
+        block_size=64,
         return_computational_ratio=True,
     )
     print("attention output norm:", flex_prefill_output.norm())
-    print(f"computational ratio: {computational_ratio*100:.2f}%")
+    print(f"computational ratio: {computational_ratio * 100:.2f}%")
