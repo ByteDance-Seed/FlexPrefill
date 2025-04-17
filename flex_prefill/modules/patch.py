@@ -52,8 +52,8 @@ ATTENTION_CONFIG_EXAMPLE = {
         "block_size": 128,
         "flex_prefill_gamma": 0.9,
         "flex_prefill_tau": 0.1,
-        "flex_prefill_min_budget": 512,
-        "flex_prefill_max_budget": 32768,
+        "flex_prefill_min_budget": 1024,
+        "flex_prefill_max_budget": None,
     },
 }
 
@@ -103,9 +103,9 @@ def patch_model_config(model: PreTrainedModel, pattern: str, cfg: dict):
             cfg = json.load(f)
         setattr(model.config, "minfer_config", cfg)
     else:
-        # for k, v in ATTENTION_CONFIG_EXAMPLE[pattern].items():
-        #     if k not in cfg:
-        #         cfg[k] = v
+        for k, v in ATTENTION_CONFIG_EXAMPLE[pattern].items():
+            if k not in cfg:
+                cfg[k] = v
         for k, v in cfg.items():
             setattr(model.config, k, v)
 
