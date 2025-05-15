@@ -1055,7 +1055,7 @@ def block_wise_prefill_attention_kernel(
     NUM_SHARE_Q_HEADS,
     Q_LEN,
     K_LEN,
-    HEAD_DIM: tl.constexpr,
+    HEAD_DIM,
     NUM_BLOCK,
     grid_offset,
     # softmax_scale
@@ -1088,15 +1088,18 @@ def block_wise_prefill_attention_kernel(
     # META parameters
     BLOCK_SIZE_Q: tl.constexpr,  # q block size
     BLOCK_SIZE_K: tl.constexpr,  # k block size
+    BLOCK_SIZE_D: tl.constexpr,  # d block size
 ):
     tl.static_assert(BLOCK_SIZE_Q == BLOCK_SIZE_K)
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    pid_bh = tl.program_id(0)
+    pid_b = pid_bh // NUM_HEADS
+    pid_h = pid_bh % NUM_HEADS
     if gqa_interleave:
         pid_kh = pid_h % NUM_KV_HEADS
     else:
         pid_kh = pid_h // NUM_SHARE_Q_HEADS
-    pid_q = tl.program_id(2)
+    pid_q = tl.program_id(1)
+    pid_d = tl.program_id(2)
     # get column index bin
     idx_bin_ptr = idx_bin_ptr + pid_b * stride_ib + pid_h * stride_ih
     bin_start = tl.load(idx_bin_ptr + pid_q * stride_it)
@@ -1112,7 +1115,7 @@ def block_wise_prefill_attention_kernel(
         shape=(Q_LEN, HEAD_DIM),
         strides=(stride_qn, stride_qd),
         offsets=(pid_q * BLOCK_SIZE_Q - grid_offset, 0),
-        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_D),
         order=(1, 0),
     )
     k_ptrs = tl.make_block_ptr(
@@ -1120,7 +1123,7 @@ def block_wise_prefill_attention_kernel(
         shape=(HEAD_DIM, K_LEN),
         strides=(stride_kd, stride_kn),
         offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_SIZE_K),
+        block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
         order=(0, 1),
     )
     v_ptrs = tl.make_block_ptr(
@@ -1128,7 +1131,7 @@ def block_wise_prefill_attention_kernel(
         shape=(K_LEN, HEAD_DIM),
         strides=(stride_vn, stride_vd),
         offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_K, HEAD_DIM),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
         order=(1, 0),
     )
     # load q
@@ -1138,7 +1141,7 @@ def block_wise_prefill_attention_kernel(
     off_n = tl.arange(0, BLOCK_SIZE_K)
     m_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
-    acc_o = tl.full((BLOCK_SIZE_Q, HEAD_DIM), 0, dtype=tl.float32)
+    acc_o = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_D), 0, dtype=tl.float32)
     # flash attention
     for i in range(0, num_active_block):
         # get current block start index
@@ -1146,7 +1149,7 @@ def block_wise_prefill_attention_kernel(
         block_idx_ptr = block_idx_ptr + stride_bt
         # load k
         k = tl.load(
-            tl.advance(k_ptrs, (0, c)), boundary_check=(1,), padding_option="zero"
+            tl.advance(k_ptrs, (0, c)), boundary_check=(0, 1), padding_option="zero"
         )
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_K), dtype=tl.float32)
@@ -1162,7 +1165,7 @@ def block_wise_prefill_attention_kernel(
         acc_o = acc_o * acc_o_scale[:, None]
         # load v and update acc_o
         v = tl.load(
-            tl.advance(v_ptrs, (c, 0)), boundary_check=(0,), padding_option="zero"
+            tl.advance(v_ptrs, (c, 0)), boundary_check=(0, 1), padding_option="zero"
         )
         p = p.to(v.dtype)
         acc_o += tl.dot(p, v)
@@ -1177,10 +1180,10 @@ def block_wise_prefill_attention_kernel(
         shape=(Q_LEN, HEAD_DIM),
         strides=(stride_on, stride_od),
         offsets=(pid_q * BLOCK_SIZE_Q - grid_offset, 0),
-        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_D),
         order=(1, 0),
     )
-    tl.store(o_ptrs, acc_o.to(tl.bfloat16), boundary_check=(0,))
+    tl.store(o_ptrs, acc_o.to(tl.bfloat16), boundary_check=(0, 1))
 
 
 def triton_block_wise_prefill_attention(
@@ -1213,7 +1216,7 @@ def triton_block_wise_prefill_attention(
     batch_size, k_len, num_kv_heads, head_dim = k.shape
     assert q.dtype == torch.bfloat16
     assert q_len == k_len
-    assert head_dim in {16, 32, 64, 128}, "only support head_dim in {16, 32, 64, 128}"
+    assert head_dim <= 128, "only support head_dim <= 128"
     assert block_size in {
         32,
         64,
@@ -1254,15 +1257,16 @@ def triton_block_wise_prefill_attention(
         softmax_scale = softmax_scale * math.log2(math.e)
     # sort idx and get block index bins
     block_idx = block_idx.sort(-1).values
-    if triton.__version__ == "3.0.0":
+    if int(triton.__version__.split(".")[0]) >= 3:
         idx_bins = triton_column_count_cumsum(block_idx, total_k_blocks)
     else:
-        warnings.warn("triton version 3.0.0 is required for faster attention")
+        warnings.warn("triton version greater than 3.0.0 is required for faster attention")
         idx_bins = torch_column_count_cumsum(block_idx, total_k_blocks)
     # launch attention kernel
     o = torch.empty_like(q)
     num_warps, num_stages = get_num_warps_stages(head_dim, block_size, GPU_NAME)
-    block_wise_prefill_attention_kernel[(batch_size, num_q_heads, total_q_blocks)](
+    BLOCK_SIZE_D=min(128, triton.next_power_of_2(head_dim))
+    block_wise_prefill_attention_kernel[(batch_size * num_q_heads, total_q_blocks, triton.cdiv(head_dim, BLOCK_SIZE_D))](
         q,
         k,
         v,
@@ -1304,6 +1308,7 @@ def triton_block_wise_prefill_attention(
         idx_bins.stride(2),
         BLOCK_SIZE_Q=block_size,
         BLOCK_SIZE_K=block_size,
+        BLOCK_SIZE_D=BLOCK_SIZE_D,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1773,6 +1778,7 @@ else:
     flash_attn_func = triton_flash_attention
 
 
+@torch.no_grad()
 def flex_prefill_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1876,7 +1882,7 @@ def flex_prefill_attention(
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    B, N, H, D = 1, 64000, 32, 64
+    B, N, H, D = 1, 64000, 32, 128
     gamma = 0.9
     tau = 0.1
 
