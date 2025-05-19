@@ -94,6 +94,8 @@ def get_num_warps_stages(head_dim, block_size, gpu_name):
         else:
             num_warps = 2
             num_stages = 2
+    if head_dim > 128:
+        num_stages = 2
     return num_warps, num_stages
 
 
@@ -1099,7 +1101,6 @@ def block_wise_prefill_attention_kernel(
     else:
         pid_kh = pid_h // NUM_SHARE_Q_HEADS
     pid_q = tl.program_id(1)
-    pid_d = tl.program_id(2)
     # get column index bin
     idx_bin_ptr = idx_bin_ptr + pid_b * stride_ib + pid_h * stride_ih
     bin_start = tl.load(idx_bin_ptr + pid_q * stride_it)
@@ -1216,12 +1217,18 @@ def triton_block_wise_prefill_attention(
     batch_size, k_len, num_kv_heads, head_dim = k.shape
     assert q.dtype == torch.bfloat16
     assert q_len == k_len
-    assert head_dim <= 128, "only support head_dim <= 128"
-    assert block_size in {
-        32,
-        64,
-        128,
-    }, "only support block size in {32, 64, 128}"
+    assert head_dim <= 256, "only support head_dim <= 256"
+    if head_dim <= 128:
+        assert block_size in {
+            32,
+            64,
+            128,
+        }, "only support block size in {32, 64, 128} if head_dim <= 128"
+    else:
+        assert block_size in {
+            32,
+            64,
+        }, "only support block size in {32, 64} if 128 < head_dim <= 256"
     total_q_blocks = triton.cdiv(grid_offset, block_size) + triton.cdiv(
         q_len - grid_offset, block_size
     )
@@ -1260,13 +1267,15 @@ def triton_block_wise_prefill_attention(
     if int(triton.__version__.split(".")[0]) >= 3:
         idx_bins = triton_column_count_cumsum(block_idx, total_k_blocks)
     else:
-        warnings.warn("triton version greater than 3.0.0 is required for faster attention")
+        warnings.warn(
+            "triton version greater than 3.0.0 is required for faster attention"
+        )
         idx_bins = torch_column_count_cumsum(block_idx, total_k_blocks)
     # launch attention kernel
     o = torch.empty_like(q)
     num_warps, num_stages = get_num_warps_stages(head_dim, block_size, GPU_NAME)
-    BLOCK_SIZE_D=min(128, triton.next_power_of_2(head_dim))
-    block_wise_prefill_attention_kernel[(batch_size * num_q_heads, total_q_blocks, triton.cdiv(head_dim, BLOCK_SIZE_D))](
+    BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
+    block_wise_prefill_attention_kernel[(batch_size * num_q_heads, total_q_blocks)](
         q,
         k,
         v,
