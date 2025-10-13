@@ -267,7 +267,7 @@ uritemplate==4.1.1
 urllib3==2.2.2
 uvicorn==0.30.6
 uvloop==0.20.0
-vllm==0.5.4
+vllm==0.11.0
 vllm-flash-attn==2.6.1
 watchfiles==0.23.0
 wcwidth==0.2.13
